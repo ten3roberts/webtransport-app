@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::anyhow;
 use bytes::Bytes;
+use flume::{Receiver, Sender};
 use futures::{Future, Stream, StreamExt};
 use itertools::Itertools;
 use js_sys::{Boolean, JsString, Reflect, Uint8Array};
@@ -50,72 +51,78 @@ fn App() -> Html {
     };
 
     html! {
-    <div>
+        <div class="content">
         <Form onsubmit={on_submit}><TextInput name="Url" onchanged={&on_url}/></Form>
 
-        { client }
-    </div>
+            { client }
+            </div>
     }
 }
 
+#[derive(Debug)]
+enum Event {
+    Datagram(Bytes),
+    Error(anyhow::Error),
+}
+
+enum Action {
+    SendDatagram(Bytes),
+}
+
 pub struct ClientInstance {
-    url: Url,
-    /// Receives datagrams from the network
-    on_datagram: Box<dyn FnMut(Bytes)>,
-    on_ready: Box<dyn FnOnce(ClientConnection)>,
-    on_error: Box<dyn Fn(anyhow::Error)>,
+    event_rx: Receiver<Event>,
+    action_tx: Sender<Action>,
 }
 
 impl ClientInstance {
-    fn spawn(mut self) {
-        let (datagrams_tx, datagrams_rx) = flume::unbounded::<Bytes>();
+    fn new(url: Url) -> Self {
+        let (event_tx, event_rx) = flume::bounded::<Event>(128);
+        let (action_tx, action_rx) = flume::bounded::<Action>(128);
 
         let run = async move {
-            let mut conn = Connection::connect(self.url).await?;
-
-            (self.on_ready)(ClientConnection {
-                outgoing_datagrams: datagrams_tx,
-            });
+            tracing::info!("Opening connection");
+            let mut conn = Connection::connect(url).await?;
 
             loop {
-                select! {
-                        Ok(data) = datagrams_rx.recv_async() => {
-                            tracing::info!("Sending datagram");
-                            conn.send_datagram(&data).await?;
+                let res = select! {
+                        Ok(action) = action_rx.recv_async() => {
+                            match action {
+                                Action::SendDatagram(data) => conn.send_datagram(&data[..]).await?,
+                            }
+
+                            Ok(()) as anyhow::Result<_>
                         },
-                        Some(datagram) = conn.incoming_datagrams.next() => {
-                            let datagram = datagram?;
-                            (self.on_datagram)(datagram);
+                        Some(data) = conn.incoming_datagrams.next() => {
+                            let data = data?;
+                            event_tx.send_async(Event::Datagram(data)).await.ok();
+                            Ok(())
                         },
                         else => { break; }
+                };
+
+                if let Err(err) = res {
+                    event_tx.send_async(Event::Error(err)).await.ok();
                 }
             }
 
-            Ok::<_, anyhow::Error>(())
+            Ok(()) as anyhow::Result<_>
         };
 
         wasm_bindgen_futures::spawn_local(async move {
             match run.await {
-                Ok(_) => {
+                Ok(()) => {
                     tracing::info!("Exiting connection loop");
                 }
                 Err(err) => {
                     tracing::error!("Client error\n\n{err:?}");
-                    (self.on_error)(err)
                 }
             }
         });
-    }
-}
 
-#[derive(Clone)]
-struct ClientConnection {
-    outgoing_datagrams: flume::Sender<Bytes>,
-}
-
-impl ClientConnection {
-    fn send_datagram(&self, data: Bytes) -> Result<(), flume::SendError<Bytes>> {
-        self.outgoing_datagrams.send(data)
+        ClientInstance {
+            event_rx,
+            action_tx,
+        }
     }
 }
 
@@ -130,7 +137,6 @@ fn ClientView(props: &ClientProps) -> Html {
     let url = props.url.clone();
 
     let messages = use_state(|| Arc::new(Mutex::new(Vec::new())));
-    let errors = use_state(|| Arc::new(Mutex::new(Vec::new())));
 
     let on_datagram = {
         let messages = messages.clone();
@@ -142,62 +148,42 @@ fn ClientView(props: &ClientProps) -> Html {
         })
     };
 
-    let client = use_state(|| None);
+    let client = use_state(|| Arc::new(ClientInstance::new(url)));
 
-    if client.is_none() {
-        tracing::info!("Opening connection");
-        let set_client = client.setter();
-        let errors = errors.clone();
-        ClientInstance {
-            url,
-            on_datagram,
-            on_ready: Box::new(move |client| set_client.set(Some(client))),
-            on_error: Box::new(move |err| {
-                errors.lock().push(format!("{err:?}"));
-                errors.set(errors.deref().clone());
-            }),
-        }
-        .spawn();
+    {
+        let client = client.clone();
+        let messages = messages.clone();
+
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Ok(event) = client.event_rx.recv_async().await {
+                messages.lock().push(format!("{event:#?}"));
+                messages.set(messages.deref().clone());
+            }
+        });
     }
 
-    let client = match (*client).clone() {
-        Some(client) => {
-            let send_datagram = Callback::from(move |v: String| {
-                let data: Bytes = v.into_bytes().into();
+    let send_datagram = Callback::from(move |v: String| {
+        let data: Bytes = v.into_bytes().into();
 
-                if let Err(err) = client.send_datagram(data) {
-                    tracing::error!("{err:?}");
-                }
-            });
-
-            html! {
-            <div>
-                <span>{"Connected to "}{props.url.clone()}</span>
-                <MessageBox send_datagram={send_datagram}/>
-            </div>
-            }
+        if let Err(err) = client.action_tx.send(Action::SendDatagram(data)) {
+            tracing::error!("{err:?}");
         }
-        None => {
-            html! { <span>{"Connecting to server..."}</span> }
-        }
-    };
+    });
 
     html! {
 
         <div>
-        <div class="message-view">
-            <ul>
-                { messages.lock().iter().map(|v| html! {<li>{v}</li>} ).collect::<Html>() }
-            </ul>
-        </div>
+            <div>
+                <span>{"Connected to "}{props.url.clone()}</span>
+                <MessageBox send_datagram={send_datagram}/>
+            </div>
 
-        <div class="errors-view">
-            <ul>
-                { errors.lock().iter().map(|v| html! {<li class="error">{v}</li>} ).collect::<Html>() }
-            </ul>
-        </div>
+            <div class="message-view">
+                <ul>
+                    { messages.lock().iter().map(|v| html! {<li class="message">{v}</li>} ).collect::<Html>() }
+                </ul>
+            </div>
 
-        {client}
         </div>
     }
 }
@@ -223,7 +209,7 @@ fn MessageBox(props: &MessageBoxProps) -> Html {
 
     html! {
         <div>
-            <Form onsubmit={on_submit}><TextInput name="Message" onchanged={on_text}/></Form>
+        <Form onsubmit={on_submit}><TextInput name="Message" onchanged={on_text}/></Form>
         </div>
     }
 }
