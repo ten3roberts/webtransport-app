@@ -1,0 +1,47 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+yew = { version = "0.20.0", features = ["csr"] }
+web-sys = { git = "https://github.com/rustwasm/wasm-bindgen.git", features = [
+    "WebSocket",
+    "WebTransport",
+    "WritableStream",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "ReadableStreamReadResult",
+    "WebTransportSendStream",
+    "WritableStreamDefaultWriter",
+    "WebTransportDatagramDuplexStream",
+    "WebTransportCloseInfo",
+    "WebTransportBidirectionalStream",
+    "WebTransportReceiveStream",
+] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+
+tracing = "0.1"
+tracing-web = "0.1"
+tracing-subscriber = { version = "0.3", features = ["time"] }
+time = { version = "0.3", features = ["js-sys", "wasm-bindgen"] }
+url = "2.3"
+anyhow = "1.0"
+bytes = "1.4"
+flume = "0.10"
+tokio = { version = "1.0", default_features = true, features = ["macros"] }
+futures = "0.3"
+pin-project = "1.0"
+itertools = "0.10"
+parking_lot = "0.12"
+
+[patch.crates-io]
+web-sys = { git = "https://github.com/rustwasm/wasm-bindgen.git" }
+wasm-bindgen = { git = "https://github.com/rustwasm/wasm-bindgen.git" }
+js-sys = { git = "https://github.com/rustwasm/wasm-bindgen.git" }
+wasm-bindgen-futures = { git = "https://github.com/rustwasm/wasm-bindgen.git" }
+wasm-bindgen-shared = { git = "https://github.com/rustwasm/wasm-bindgen.git" }
