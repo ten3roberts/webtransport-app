@@ -46,9 +46,16 @@ input {
   margin: 0.25em 0.25em;
 }
 
+button {
+  border: 1px solid gray;
+  padding: 0.5em 1em;
+  margin: 0.25em 0.25em;
+}
+
 input[type="button"],
 input[type="submit"],
-input[type="reset"] {
+input[type="reset"],
+button {
   background-color: #127369;
   border: none;
   color: white;
@@ -58,4 +65,10 @@ input[type="reset"] {
 
 .error {
   color: red;
+}
+
+.flex {
+  display: flex;
+  flex-direction: row;
+  justify-content: center;
 }

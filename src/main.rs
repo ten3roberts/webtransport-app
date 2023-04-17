@@ -1,29 +1,27 @@
-use std::{
-    borrow::BorrowMut, cell::RefCell, net::SocketAddr, ops::Deref, pin::Pin, rc::Rc, str::FromStr,
-    sync::Arc, task::Poll,
-};
+use core::task;
+use std::{io, ops::Deref, pin::Pin, str::FromStr, sync::Arc, task::Poll};
 
 use anyhow::anyhow;
 use bytes::Bytes;
+use closure::closure;
 use flume::{Receiver, Sender};
-use futures::{Future, Stream, StreamExt};
-use itertools::Itertools;
+use futures::{ready, AsyncWrite, AsyncWriteExt, Future, FutureExt, Stream, StreamExt};
 use js_sys::{Boolean, JsString, Reflect, Uint8Array};
 use parking_lot::Mutex;
-use tokio::{join, select};
+use pin_project::pin_project;
+use tokio::select;
 use tracing_subscriber::{
     fmt::time::UtcTime, prelude::__tracing_subscriber_SubscriberExt, registry,
     util::SubscriberInitExt,
 };
 use tracing_web::MakeConsoleWriter;
 use url::Url;
-use wasm_bindgen::{prelude::Closure, JsCast, JsValue};
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    EventTarget, HtmlInputElement, ReadableStream, ReadableStreamDefaultReader, WebTransport,
-    WebTransportCloseInfo, WritableStream, WritableStreamDefaultWriter,
+    ReadableStreamDefaultReader, WebTransport, WritableStream, WritableStreamDefaultWriter,
 };
-use yew::{prelude::*, suspense::use_future};
+use yew::prelude::*;
 mod input;
 use input::*;
 
@@ -36,26 +34,40 @@ fn App() -> Html {
         set_url.set(Some(Url::from_str(&v)));
     });
 
-    let on_submit = Callback::from(|()| tracing::info!("Submitted form"));
+    let client = use_state(|| None);
 
-    let client = match url.deref() {
+    let connect = match url.deref().clone() {
         Some(Ok(url)) => {
-            html! { <ClientView url={url.clone()}/> }
+            let connect = Callback::from(
+                closure!(clone client, |_| client.set(Some(Arc::new(ClientInstance::new(url.clone()))))
+                ),
+            );
+
+            html! { <button onclick={connect}>{"Connect"}</button> }
         }
         Some(Err(err)) => {
             html! { <span>{err}</span> }
         }
         None => {
-            html! { <span>{"No url specified"}</span> }
+            html! { <span>{"No url"}</span> }
         }
     };
 
     html! {
         <div class="content">
-        <Form onsubmit={on_submit}><TextInput name="Url" onchanged={&on_url}/></Form>
+            <div class="flex">
+                <form method="post">
+                    <TextInput name="Url" onchanged={&on_url}/>
+                </form>
 
-            { client }
+                {connect}
             </div>
+
+        if let Some(client) = &*client {
+            <ClientView client={client}/>
+        }
+
+        </div>
     }
 }
 
@@ -67,9 +79,11 @@ enum Event {
 
 enum Action {
     SendDatagram(Bytes),
+    SendUni(Bytes),
 }
 
 pub struct ClientInstance {
+    url: Url,
     event_rx: Receiver<Event>,
     action_tx: Sender<Action>,
 }
@@ -79,15 +93,24 @@ impl ClientInstance {
         let (event_tx, event_rx) = flume::bounded::<Event>(128);
         let (action_tx, action_rx) = flume::bounded::<Action>(128);
 
+        let u = url.clone();
         let run = async move {
             tracing::info!("Opening connection");
-            let mut conn = Connection::connect(url).await?;
+            let mut conn = Connection::connect(u).await?;
 
             loop {
                 let res = select! {
                         Ok(action) = action_rx.recv_async() => {
                             match action {
                                 Action::SendDatagram(data) => conn.send_datagram(&data[..]).await?,
+                                Action::SendUni(data) => {
+                                    tracing::info!("Opening uni stream");
+                                    let mut stream = conn.open_uni().await?;
+                                    tracing::info!("Opened uni stream");
+
+                                    stream.write_all(&data).await?;
+                                    tracing::info!("Wrote all");
+                                }
                             }
 
                             Ok(()) as anyhow::Result<_>
@@ -120,35 +143,34 @@ impl ClientInstance {
         });
 
         ClientInstance {
+            url,
             event_rx,
             action_tx,
         }
     }
 }
 
-#[derive(Properties, PartialEq)]
+#[derive(Properties)]
 struct ClientProps {
-    url: Url,
+    client: Arc<ClientInstance>,
+}
+
+impl PartialEq for ClientProps {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(
+            &*self.client as *const ClientInstance,
+            &*other.client as *const ClientInstance,
+        )
+    }
 }
 
 #[function_component]
 fn ClientView(props: &ClientProps) -> Html {
     tracing::info!("ClientView");
-    let url = props.url.clone();
+
+    let client = props.client.clone();
 
     let messages = use_state(|| Arc::new(Mutex::new(Vec::new())));
-
-    let on_datagram = {
-        let messages = messages.clone();
-        Box::new(move |bytes: Bytes| {
-            let s = String::from_utf8_lossy(&bytes).into_owned();
-            tracing::info!("Received datagram from server: {s:?}");
-            messages.lock().push(s);
-            messages.set(messages.deref().clone());
-        })
-    };
-
-    let client = use_state(|| Arc::new(ClientInstance::new(url)));
 
     {
         let client = client.clone();
@@ -162,20 +184,27 @@ fn ClientView(props: &ClientProps) -> Html {
         });
     }
 
-    let send_datagram = Callback::from(move |v: String| {
+    let send_datagram = Callback::from(closure!( clone client,|v: String| {
         let data: Bytes = v.into_bytes().into();
 
         if let Err(err) = client.action_tx.send(Action::SendDatagram(data)) {
             tracing::error!("{err:?}");
         }
-    });
+    }));
+
+    let send_uni = Callback::from(closure!(clone client, |v: String| {
+        let data: Bytes = v.into_bytes().into();
+
+        if let Err(err) = client.action_tx.send(Action::SendUni(data)) {
+            tracing::error!("{err:?}");
+        }
+    }));
 
     html! {
-
         <div>
             <div>
-                <span>{"Connected to "}{props.url.clone()}</span>
-                <MessageBox send_datagram={send_datagram}/>
+                <span>{"Connected to "}{client.url.clone()}</span>
+                <MessageBox senddatagram={send_datagram} senduni={send_uni}/>
             </div>
 
             <div class="message-view">
@@ -183,14 +212,14 @@ fn ClientView(props: &ClientProps) -> Html {
                     { messages.lock().iter().map(|v| html! {<li class="message">{v}</li>} ).collect::<Html>() }
                 </ul>
             </div>
-
         </div>
     }
 }
 
 #[derive(Properties, PartialEq)]
 struct MessageBoxProps {
-    send_datagram: Callback<String>,
+    senddatagram: Callback<String>,
+    senduni: Callback<String>,
 }
 
 #[function_component]
@@ -204,12 +233,20 @@ fn MessageBox(props: &MessageBoxProps) -> Html {
         })
     };
 
-    let send_datagram = props.send_datagram.clone();
-    let on_submit = Callback::from(move |()| send_datagram.emit(text.deref().clone()));
+    let senddatagram = props.senddatagram.clone();
+    let senduni = props.senduni.clone();
+
+    let send_datagram =
+        Callback::from(closure!(clone text,  |_| senddatagram.emit(text.deref().clone())));
+    let send_uni = Callback::from(closure!(clone text, |_| senduni.emit(text.deref().clone())));
 
     html! {
         <div>
-        <Form onsubmit={on_submit}><TextInput name="Message" onchanged={on_text}/></Form>
+            <form method="post">
+                <TextInput name="Message" onchanged={on_text}/>
+            </form>
+            <button onclick={ send_datagram }>{"Send Datagram"}</button>
+            <button onclick={ send_uni }>{"Send Uni"}</button>
         </div>
     }
 }
@@ -252,6 +289,23 @@ impl Connection {
         })
     }
 
+    pub async fn open_uni(&self) -> anyhow::Result<SendStream> {
+        let stream = JsFuture::from(self.transport.create_unidirectional_stream())
+            .await
+            .map_err(|e| anyhow!("{e:?}"))?
+            .dyn_into::<WritableStream>()
+            .unwrap();
+
+        let writer = stream.get_writer().unwrap();
+
+        Ok(SendStream {
+            close: None,
+            fut: None,
+            stream,
+            writer: Some(writer),
+        })
+    }
+
     /// Sends data to a WebTransport connection.
     pub async fn send_datagram(&self, data: &[u8]) -> anyhow::Result<()> {
         let data = Uint8Array::from(data);
@@ -265,8 +319,106 @@ impl Connection {
     }
 }
 
+#[derive(thiserror::Error, Debug, Clone)]
+pub enum SendError {
+    #[error("Failed to send data to stream: {0}")]
+    SendFailed(String),
+    #[error("Failed to close the stream: {0}")]
+    CloseFailed(String),
+}
+
+pub struct SendStream {
+    close: Option<JsFuture>,
+    fut: Option<JsFuture>,
+    stream: WritableStream,
+    writer: Option<WritableStreamDefaultWriter>,
+}
+
+impl Drop for SendStream {
+    fn drop(&mut self) {
+        self.close()
+    }
+}
+
+impl From<SendError> for io::Error {
+    fn from(value: SendError) -> Self {
+        io::Error::new(io::ErrorKind::Other, value)
+    }
+}
+
+impl SendStream {
+    pub fn close(&mut self) {
+        self.writer = None;
+        if let Some(writer) = self.writer.take() {
+            writer.release_lock();
+            let _ = self.stream.close();
+        }
+    }
+
+    pub fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), SendError>> {
+        tracing::info!("Poll send");
+        if let Some(fut) = &mut self.fut {
+            ready!(fut.poll_unpin(cx).map_err(|err| {
+                tracing::error!("Sending failed: {err:?}");
+                SendError::SendFailed(format!("{err:?}"))
+            }))?;
+            self.fut = None;
+
+            tracing::info!("ready to send");
+
+            Poll::Ready(Ok(()))
+        } else {
+            tracing::info!("nothing to send");
+            Poll::Ready(Ok(()))
+        }
+    }
+    pub fn send_chunk(&mut self, buf: &[u8]) {
+        tracing::info!("send_chunk {buf:?}");
+        if self.fut.is_some() {
+            panic!("Send not ready");
+        }
+
+        let writer = self.writer.as_mut().expect("Stream is closed");
+
+        let chunk = Uint8Array::from(buf);
+        self.fut = Some(JsFuture::from(writer.write_with_chunk(&chunk)));
+    }
+}
+
+impl AsyncWrite for SendStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        tracing::info!("poll_write");
+        ready!(self.poll_ready(cx))?;
+
+        let len = buf.len();
+        self.send_chunk(buf);
+
+        Poll::Ready(Ok(len))
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.close();
+
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// Cancellation safe datagram reader
-#[pin_project::pin_project]
+#[pin_project]
 pub struct Datagrams {
     // Pending read
     #[pin]
