@@ -1,4 +1,4 @@
-use core::task;
+use core::task::{self, Context};
 use std::{io, ops::Deref, pin::Pin, str::FromStr, sync::Arc, task::Poll};
 
 use anyhow::anyhow;
@@ -9,6 +9,7 @@ use futures::{ready, AsyncWrite, AsyncWriteExt, Future, FutureExt, Stream, Strea
 use js_sys::{Boolean, JsString, Reflect, Uint8Array};
 use parking_lot::Mutex;
 use pin_project::pin_project;
+use thiserror::Error;
 use tokio::select;
 use tracing_subscriber::{
     fmt::time::UtcTime, prelude::__tracing_subscriber_SubscriberExt, registry,
@@ -19,7 +20,8 @@ use url::Url;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    ReadableStreamDefaultReader, WebTransport, WritableStream, WritableStreamDefaultWriter,
+    ReadableStream, ReadableStreamDefaultReader, WebTransport, WebTransportBidirectionalStream,
+    WritableStream, WritableStreamDefaultWriter,
 };
 use yew::prelude::*;
 mod input;
@@ -255,6 +257,8 @@ pub struct Connection {
     transport: WebTransport,
     datagrams: WritableStreamDefaultWriter,
     incoming_datagrams: Datagrams,
+    incoming_recv_streams: ReadableStreamDefaultReader,
+    incoming_bi_streams: ReadableStreamDefaultReader,
 }
 
 impl Connection {
@@ -282,10 +286,28 @@ impl Connection {
             stream: incoming_datagrams,
         };
 
+        let incoming_recv_streams = {
+            transport
+                .incoming_unidirectional_streams()
+                .get_reader()
+                .dyn_into()
+                .unwrap()
+        };
+
+        let incoming_bi_streams = {
+            transport
+                .incoming_bidirectional_streams()
+                .get_reader()
+                .dyn_into()
+                .unwrap()
+        };
+
         Ok(Connection {
             transport,
             datagrams,
             incoming_datagrams,
+            incoming_recv_streams,
+            incoming_bi_streams,
         })
     }
 
@@ -306,6 +328,43 @@ impl Connection {
         })
     }
 
+    /// Accepts an incoming bidirectional stream
+    pub async fn accept_bi(&self) -> anyhow::Result<(SendStream, RecvStream)> {
+        let stream = JsFuture::from(self.incoming_bi_streams.read())
+            .await
+            .map_err(|e| anyhow!("{e:?}"))?
+            .dyn_into::<WebTransportBidirectionalStream>()
+            .unwrap();
+
+        tracing::info!("Got bidirectional stream");
+
+        let recv = stream.readable().dyn_into().unwrap();
+        let send = stream.writable().dyn_into().unwrap();
+
+        // Use the new methods
+        Ok((SendStream::new(send), RecvStream::new(recv)))
+    }
+
+    /// Accepts an incoming unidirectional stream
+    pub async fn accept_uni(&self) -> anyhow::Result<RecvStream> {
+        let stream = JsFuture::from(self.incoming_recv_streams.read())
+            .await
+            .map_err(|e| anyhow!("{e:?}"))?
+            .dyn_into::<ReadableStream>()
+            .unwrap();
+
+        tracing::info!("Got unidirectional stream");
+
+        let reader = stream.get_reader().dyn_into().unwrap();
+
+        Ok(RecvStream {
+            close: None,
+            fut: None,
+            reader: Some(reader),
+            stream,
+        })
+    }
+
     /// Sends data to a WebTransport connection.
     pub async fn send_datagram(&self, data: &[u8]) -> anyhow::Result<()> {
         let data = Uint8Array::from(data);
@@ -317,6 +376,59 @@ impl Connection {
 
         Ok(())
     }
+}
+
+pub struct RecvStream {
+    close: Option<JsFuture>,
+    fut: Option<JsFuture>,
+    reader: Option<ReadableStreamDefaultReader>,
+    stream: ReadableStream,
+}
+
+impl RecvStream {
+    fn new(stream: ReadableStream) -> Self {
+        let reader = stream.get_reader().dyn_into().unwrap();
+
+        Self {
+            close: None,
+            fut: None,
+            reader: Some(reader),
+            stream,
+        }
+    }
+
+    pub fn close(&mut self) {
+        self.reader = None;
+        if let Some(reader) = self.reader.take() {
+            reader.release_lock();
+            let _ = self.close.take();
+        }
+    }
+
+    /// Read the next Uint8Array from the stream.
+    pub fn poll_read(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bytes, RecvError>> {
+        loop {
+            if let Some(fut) = &mut self.fut {
+                let data = ready!(fut.poll_unpin(cx))
+                    .map_err(|err| RecvError::ReadError(format!("{err:?}")))?
+                    .dyn_into::<Uint8Array>()
+                    .unwrap();
+
+                let data = data.to_vec().into();
+                return Poll::Ready(Ok(data));
+            } else {
+                let reader = self.reader.as_ref().expect("Stream is closed");
+                let fut = JsFuture::from(reader.read());
+                self.fut = Some(fut);
+            }
+        }
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum RecvError {
+    #[error("Failed to read from stream: {0}")]
+    ReadError(String),
 }
 
 #[derive(thiserror::Error, Debug, Clone)]
@@ -347,6 +459,17 @@ impl From<SendError> for io::Error {
 }
 
 impl SendStream {
+    fn new(stream: WritableStream) -> Self {
+        let writer = stream.get_writer().unwrap();
+
+        SendStream {
+            close: None,
+            fut: None,
+            stream,
+            writer: Some(writer),
+        }
+    }
+
     pub fn close(&mut self) {
         self.writer = None;
         if let Some(writer) = self.writer.take() {
@@ -355,7 +478,7 @@ impl SendStream {
         }
     }
 
-    pub fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), SendError>> {
+    pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), SendError>> {
         tracing::info!("Poll send");
         if let Some(fut) = &mut self.fut {
             ready!(fut.poll_unpin(cx).map_err(|err| {
@@ -388,7 +511,7 @@ impl SendStream {
 impl AsyncWrite for SendStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         tracing::info!("poll_write");
@@ -400,17 +523,11 @@ impl AsyncWrite for SendStream {
         Poll::Ready(Ok(len))
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         self.poll_ready(cx).map_err(Into::into)
     }
 
-    fn poll_close(
-        mut self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         self.close();
 
         Poll::Ready(Ok(()))
