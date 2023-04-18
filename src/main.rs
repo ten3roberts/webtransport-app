@@ -1,11 +1,11 @@
 use core::task::{self, Context};
-use std::{io, ops::Deref, pin::Pin, str::FromStr, sync::Arc, task::Poll};
+use std::{io, ops::Deref, pin::Pin, str::FromStr, sync::Arc, task::Poll, time::Duration};
 
 use anyhow::anyhow;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use closure::closure;
 use flume::{Receiver, Sender};
-use futures::{ready, AsyncWrite, AsyncWriteExt, Future, FutureExt, Stream, StreamExt};
+use futures::{ready, AsyncRead, AsyncWrite, AsyncWriteExt, Future, FutureExt, Stream, StreamExt};
 use js_sys::{Boolean, JsString, Reflect, Uint8Array};
 use parking_lot::Mutex;
 use pin_project::pin_project;
@@ -110,7 +110,12 @@ impl ClientInstance {
                                     let mut stream = conn.open_uni().await?;
                                     tracing::info!("Opened uni stream");
 
-                                    stream.write_all(&data).await?;
+                                    // Write one byte at a time
+                                    for byte in data {
+                                        stream.write_all(&[byte]).await?;
+                                        yew::platform::time::sleep(Duration::from_millis(1000)).await;
+                                    }
+
                                     tracing::info!("Wrote all");
                                 }
                             }
@@ -261,6 +266,14 @@ pub struct Connection {
     incoming_bi_streams: ReadableStreamDefaultReader,
 }
 
+impl Drop for Connection {
+    fn drop(&mut self) {
+        tracing::info!("Dropping connection");
+
+        self.transport.close();
+    }
+}
+
 impl Connection {
     /// Open a connection to `url`
     pub async fn connect(url: Url) -> anyhow::Result<Self> {
@@ -274,17 +287,9 @@ impl Connection {
 
         let datagrams = transport.datagrams();
         let datagrams = datagrams.writable().get_writer().unwrap();
-        let incoming_datagrams = transport
-            .datagrams()
-            .readable()
-            .get_reader()
-            .dyn_into()
-            .unwrap();
+        let incoming_datagrams = transport.datagrams().readable();
 
-        let incoming_datagrams = Datagrams {
-            fut: None,
-            stream: incoming_datagrams,
-        };
+        let incoming_datagrams = Datagrams::new(incoming_datagrams);
 
         let incoming_recv_streams = {
             transport
@@ -321,7 +326,6 @@ impl Connection {
         let writer = stream.get_writer().unwrap();
 
         Ok(SendStream {
-            close: None,
             fut: None,
             stream,
             writer: Some(writer),
@@ -358,10 +362,10 @@ impl Connection {
         let reader = stream.get_reader().dyn_into().unwrap();
 
         Ok(RecvStream {
-            close: None,
             fut: None,
             reader: Some(reader),
             stream,
+            buf: Bytes::new(),
         })
     }
 
@@ -372,17 +376,21 @@ impl Connection {
             .await
             .map_err(|e| anyhow!("{e:?}"));
 
-        // self.datagrams.release_lock();
-
         Ok(())
     }
 }
 
 pub struct RecvStream {
-    close: Option<JsFuture>,
     fut: Option<JsFuture>,
+    buf: Bytes,
     reader: Option<ReadableStreamDefaultReader>,
     stream: ReadableStream,
+}
+
+impl Drop for RecvStream {
+    fn drop(&mut self) {
+        // self.close();
+    }
 }
 
 impl RecvStream {
@@ -390,23 +398,27 @@ impl RecvStream {
         let reader = stream.get_reader().dyn_into().unwrap();
 
         Self {
-            close: None,
             fut: None,
             reader: Some(reader),
             stream,
+            buf: Bytes::new(),
         }
     }
 
+    /// Closes the stream
     pub fn close(&mut self) {
-        self.reader = None;
         if let Some(reader) = self.reader.take() {
             reader.release_lock();
-            let _ = self.close.take();
+            let _ = self.stream.cancel();
         }
     }
 
-    /// Read the next Uint8Array from the stream.
-    pub fn poll_read(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bytes, RecvError>> {
+    /// Read the next chunk of data from the stream.
+    pub fn poll_read_chunk(&mut self, cx: &mut Context<'_>) -> Poll<Result<&mut Bytes, RecvError>> {
+        if !self.buf.is_empty() {
+            return Poll::Ready(Ok(&mut self.buf));
+        }
+
         loop {
             if let Some(fut) = &mut self.fut {
                 let data = ready!(fut.poll_unpin(cx))
@@ -414,14 +426,37 @@ impl RecvStream {
                     .dyn_into::<Uint8Array>()
                     .unwrap();
 
-                let data = data.to_vec().into();
-                return Poll::Ready(Ok(data));
+                self.buf = data.to_vec().into();
+                return Poll::Ready(Ok(&mut self.buf));
             } else {
                 let reader = self.reader.as_ref().expect("Stream is closed");
                 let fut = JsFuture::from(reader.read());
                 self.fut = Some(fut);
             }
         }
+    }
+}
+
+impl AsyncRead for RecvStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        let bytes = ready!(self.poll_read_chunk(cx))?;
+
+        let len = buf.len().min(bytes.len());
+
+        buf[..len].copy_from_slice(&bytes[..len]);
+        bytes.advance(len);
+
+        Poll::Ready(Ok(len))
+    }
+}
+
+impl From<RecvError> for io::Error {
+    fn from(value: RecvError) -> Self {
+        io::Error::new(io::ErrorKind::Other, value)
     }
 }
 
@@ -440,7 +475,6 @@ pub enum SendError {
 }
 
 pub struct SendStream {
-    close: Option<JsFuture>,
     fut: Option<JsFuture>,
     stream: WritableStream,
     writer: Option<WritableStreamDefaultWriter>,
@@ -448,7 +482,8 @@ pub struct SendStream {
 
 impl Drop for SendStream {
     fn drop(&mut self) {
-        self.close()
+        tracing::info!("Dropping SendStream");
+        self.stop();
     }
 }
 
@@ -463,15 +498,14 @@ impl SendStream {
         let writer = stream.get_writer().unwrap();
 
         SendStream {
-            close: None,
             fut: None,
             stream,
             writer: Some(writer),
         }
     }
 
-    pub fn close(&mut self) {
-        self.writer = None;
+    /// Closes the sending stream
+    pub fn stop(&mut self) {
         if let Some(writer) = self.writer.take() {
             writer.release_lock();
             let _ = self.stream.close();
@@ -495,6 +529,7 @@ impl SendStream {
             Poll::Ready(Ok(()))
         }
     }
+
     pub fn send_chunk(&mut self, buf: &[u8]) {
         tracing::info!("send_chunk {buf:?}");
         if self.fut.is_some() {
@@ -527,37 +562,60 @@ impl AsyncWrite for SendStream {
         self.poll_ready(cx).map_err(Into::into)
     }
 
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.close();
+    fn poll_close(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Self::stop(&mut self);
 
         Poll::Ready(Ok(()))
     }
 }
 
 /// Cancellation safe datagram reader
-#[pin_project]
 pub struct Datagrams {
     // Pending read
-    #[pin]
     fut: Option<JsFuture>,
-    stream: ReadableStreamDefaultReader,
+    stream: ReadableStream,
+    reader: Option<ReadableStreamDefaultReader>,
+}
+
+impl Drop for Datagrams {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl Datagrams {
+    pub fn new(stream: ReadableStream) -> Self {
+        let reader = stream.get_reader().dyn_into().unwrap();
+
+        Datagrams {
+            fut: None,
+            stream,
+            reader: Some(reader),
+        }
+    }
+
+    pub fn stop(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            reader.release_lock();
+            let _ = self.stream.cancel();
+        }
+    }
 }
 
 impl Stream for Datagrams {
     type Item = anyhow::Result<Bytes>;
 
     fn poll_next(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        let mut p = self.project();
         loop {
-            if let Some(fut) = p.fut.as_mut().as_pin_mut() {
+            if let Some(fut) = &mut self.fut {
                 tracing::info!("Receiving datagram");
-                let result = futures::ready!(fut.poll(cx));
+                let result = futures::ready!(fut.poll_unpin(cx));
                 tracing::info!("Future finished");
 
-                *p.fut = None;
+                self.fut = None;
                 let result = result.map_err(|err| anyhow!("{err:?}"))?;
 
                 let done = Reflect::get(&result, &JsString::from("done"))
@@ -580,7 +638,9 @@ impl Stream for Datagrams {
             } else {
                 tracing::info!("Reading next datagram");
                 // Start a new read
-                *p.fut = Some(JsFuture::from(p.stream.read()));
+                self.fut = Some(JsFuture::from(
+                    self.reader.as_mut().expect("Reader is closed").read(),
+                ));
             }
         }
     }
