@@ -77,6 +77,7 @@ fn App() -> Html {
 #[derive(Debug)]
 enum Event {
     Datagram(Bytes),
+    UniStream(Bytes),
     Error(anyhow::Error),
 }
 
@@ -125,13 +126,22 @@ impl ClientInstance {
                         },
                         Some(stream) = conn.accept_uni() => {
                             let mut stream = stream?;
-                            tracing::info!("Got unidirectional stream");
 
-                            while let Some(data) = stream.read_chunk().await {
-                                let data = data?;
-                                tracing::info!("Got chunk: {data:?}");
-
-                            }
+                            let tx = event_tx.clone();
+                            wasm_bindgen_futures::spawn_local(async move {
+                                while let Some(data) = stream.read_chunk().await {
+                                    match data {
+                                        Ok(data) => {
+                                            tracing::info!("Got data: {:?}", data);
+                                            tx.send_async(Event::UniStream(data)).await.ok();
+                                        }
+                                        Err(err) => {
+                                            tracing::error!("Error reading stream: {:?}", err);
+                                            break;
+                                        }
+                                    }
+                                }
+                            });
 
 
                             Ok(())
