@@ -3,6 +3,7 @@ use std::{pin::Pin, task::Poll};
 use bytes::Bytes;
 use futures::{FutureExt, Stream};
 use js_sys::{Boolean, JsString, Reflect, Uint8Array};
+use thiserror::Error;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{ReadableStream, ReadableStreamDefaultReader};
@@ -40,8 +41,14 @@ impl Datagrams {
     }
 }
 
+#[derive(Error, Debug)]
+pub enum ReadDatagramError {
+    #[error("Failed to read from datagram stream: {0:?}")]
+    ReadError(String),
+}
+
 impl Stream for Datagrams {
-    type Item = anyhow::Result<Bytes>;
+    type Item = Result<Bytes, ReadDatagramError>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
@@ -49,19 +56,18 @@ impl Stream for Datagrams {
     ) -> Poll<Option<Self::Item>> {
         loop {
             if let Some(fut) = &mut self.fut {
-                tracing::info!("Receiving datagram");
                 let result = futures::ready!(fut.poll_unpin(cx));
-                tracing::info!("Future finished");
 
                 self.fut = None;
-                let result = result.map_err(|err| anyhow::anyhow!("{err:?}"))?;
+
+                let result =
+                    result.map_err(|err| ReadDatagramError::ReadError(format!("{err:?}")))?;
 
                 let done = Reflect::get(&result, &JsString::from("done"))
                     .unwrap()
                     .unchecked_into::<Boolean>();
 
                 if done.is_truthy() {
-                    tracing::info!("Stream is done");
                     return Poll::Ready(None);
                 } else {
                     let bytes: Uint8Array = Reflect::get(&result, &JsString::from("value"))
@@ -69,7 +75,6 @@ impl Stream for Datagrams {
                         .unchecked_into();
 
                     let bytes: Bytes = bytes.to_vec().into();
-                    tracing::info!("Got bytes");
 
                     return Poll::Ready(Some(Ok(bytes)));
                 };

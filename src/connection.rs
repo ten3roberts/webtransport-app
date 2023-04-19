@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::anyhow;
 use bytes::Bytes;
-use futures::{ready, Future, StreamExt};
+use futures::{Future, StreamExt};
 use js_sys::Uint8Array;
 use parking_lot::Mutex;
 use url::Url;
@@ -16,12 +16,12 @@ use web_sys::{
     WritableStream, WritableStreamDefaultWriter,
 };
 
-use crate::{Datagrams, RecvStream, SendStream};
+use crate::{Datagrams, ReadDatagramError, RecvStream, SendStream};
 
 pub struct Connection {
     transport: WebTransport,
     datagrams: WritableStreamDefaultWriter,
-    incoming_datagrams: Datagrams,
+    incoming_datagrams: Mutex<Datagrams>,
     incoming_recv_streams: ReadableStreamDefaultReader,
     incoming_bi_streams: ReadableStreamDefaultReader,
 }
@@ -70,7 +70,7 @@ impl Connection {
         Ok(Connection {
             transport,
             datagrams,
-            incoming_datagrams,
+            incoming_datagrams: Mutex::new(incoming_datagrams),
             incoming_recv_streams,
             incoming_bi_streams,
         })
@@ -118,6 +118,12 @@ impl Connection {
         Ok(RecvStream::new(reader))
     }
 
+    pub fn read_datagram(&self) -> ReadDatagram<'_> {
+        ReadDatagram {
+            icoming_datagrams: &self.incoming_datagrams,
+        }
+    }
+
     /// Sends data to a WebTransport connection.
     pub async fn send_datagram(&self, data: &[u8]) -> anyhow::Result<()> {
         let data = Uint8Array::from(data);
@@ -129,16 +135,17 @@ impl Connection {
     }
 }
 
-struct ReadDatagram<'a> {
+/// Reads the next datagram from the connection
+pub struct ReadDatagram<'a> {
     icoming_datagrams: &'a Mutex<Datagrams>,
 }
 
 impl Future for ReadDatagram<'_> {
-    type Output = anyhow::Result<Option<Bytes>>;
+    type Output = Option<Result<Bytes, ReadDatagramError>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut datagrams = self.icoming_datagrams.lock();
 
-        let datagram = ready!(datagrams.poll_next_unpin(cx));
+        datagrams.poll_next_unpin(cx)
     }
 }
