@@ -114,7 +114,7 @@ impl ClientInstance {
                                     // Write one byte at a time
                                     for byte in data {
                                         stream.write_all(&[byte]).await?;
-                                        yew::platform::time::sleep(Duration::from_millis(1000)).await;
+                                        yew::platform::time::sleep(Duration::from_millis(100)).await;
                                     }
 
                                     tracing::info!("Wrote all");
@@ -122,6 +122,19 @@ impl ClientInstance {
                             }
 
                             Ok(()) as anyhow::Result<_>
+                        },
+                        Some(stream) = conn.accept_uni() => {
+                            let mut stream = stream?;
+                            tracing::info!("Got unidirectional stream");
+
+                            while let Some(data) = stream.read_chunk().await {
+                                let data = data?;
+                                tracing::info!("Got chunk: {data:?}");
+
+                            }
+
+
+                            Ok(())
                         },
                         Some(data) = conn.read_datagram() => {
                             let data = data?;

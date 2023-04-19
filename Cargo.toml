@@ -40,6 +40,7 @@ itertools = "0.10"
 parking_lot = "0.12"
 closure = "0.3"
 thiserror = "1.0"
+once_cell = "1.17"
 
 [patch.crates-io]
 web-sys = { git = "https://github.com/rustwasm/wasm-bindgen.git" }

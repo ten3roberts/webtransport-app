@@ -25,6 +25,7 @@ dependencies = [
  "futures",
  "itertools",
  "js-sys",
+ "once_cell",
  "parking_lot",
  "pin-project",
  "thiserror",

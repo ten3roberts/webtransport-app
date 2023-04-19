@@ -1,11 +1,11 @@
 use std::{
-    io,
+    io, mem,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use bytes::{Buf, Bytes};
-use futures::{ready, AsyncRead, AsyncWrite, FutureExt};
+use futures::{future::poll_fn, ready, AsyncRead, AsyncWrite, Future, FutureExt};
 use js_sys::Uint8Array;
 use thiserror::Error;
 use wasm_bindgen::JsCast;
@@ -14,60 +14,41 @@ use web_sys::{
     ReadableStream, ReadableStreamDefaultReader, WritableStream, WritableStreamDefaultWriter,
 };
 
-pub struct RecvStream {
-    fut: Option<JsFuture>,
-    buf: Bytes,
-    reader: Option<ReadableStreamDefaultReader>,
-    stream: ReadableStream,
-}
+use crate::reader::{ReadError, StreamReader};
 
-impl Drop for RecvStream {
-    fn drop(&mut self) {
-        self.close();
-    }
+pub struct RecvStream {
+    buf: Bytes,
+    stream: StreamReader<Uint8Array>,
 }
 
 impl RecvStream {
     pub(crate) fn new(stream: ReadableStream) -> Self {
-        let reader = stream.get_reader().dyn_into().unwrap();
-
         Self {
-            fut: None,
-            reader: Some(reader),
-            stream,
             buf: Bytes::new(),
-        }
-    }
-
-    /// Closes the stream
-    pub fn close(&mut self) {
-        if let Some(reader) = self.reader.take() {
-            reader.release_lock();
-            let _ = self.stream.cancel();
+            stream: StreamReader::new(stream),
         }
     }
 
     /// Read the next chunk of data from the stream.
-    pub fn poll_read_chunk(&mut self, cx: &mut Context<'_>) -> Poll<Result<&mut Bytes, RecvError>> {
-        if !self.buf.is_empty() {
-            return Poll::Ready(Ok(&mut self.buf));
+    pub fn poll_read_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<&mut Bytes, ReadError>>> {
+        if self.buf.has_remaining() {
+            return Poll::Ready(Some(Ok(&mut self.buf)));
         }
 
-        loop {
-            if let Some(fut) = &mut self.fut {
-                let data = ready!(fut.poll_unpin(cx))
-                    .map_err(|err| RecvError::ReadError(format!("{err:?}")))?
-                    .dyn_into::<Uint8Array>()
-                    .unwrap();
-
-                self.buf = data.to_vec().into();
-                return Poll::Ready(Ok(&mut self.buf));
-            } else {
-                let reader = self.reader.as_ref().expect("Stream is closed");
-                let fut = JsFuture::from(reader.read());
-                self.fut = Some(fut);
-            }
+        let data = ready!(self.stream.poll_next(cx)?);
+        if let Some(data) = data {
+            self.buf = data.to_vec().into();
+            Poll::Ready(Some(Ok(&mut self.buf)))
+        } else {
+            Poll::Ready(None)
         }
+    }
+
+    pub fn read_chunk(&mut self) -> ReadChunk {
+        ReadChunk { stream: self }
     }
 }
 
@@ -77,20 +58,18 @@ impl AsyncRead for RecvStream {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, io::Error>> {
-        let bytes = ready!(self.poll_read_chunk(cx))?;
+        match ready!(self.poll_read_chunk(cx)) {
+            Some(Ok(bytes)) => {
+                let len = buf.len().min(bytes.len());
 
-        let len = buf.len().min(bytes.len());
+                buf[..len].copy_from_slice(&bytes[..len]);
+                bytes.advance(len);
 
-        buf[..len].copy_from_slice(&bytes[..len]);
-        bytes.advance(len);
-
-        Poll::Ready(Ok(len))
-    }
-}
-
-impl From<RecvError> for io::Error {
-    fn from(value: RecvError) -> Self {
-        io::Error::new(io::ErrorKind::Other, value)
+                Poll::Ready(Ok(len))
+            }
+            Some(Err(err)) => Poll::Ready(Err(err.into())),
+            None => Poll::Ready(Ok(0)),
+        }
     }
 }
 
@@ -147,7 +126,6 @@ impl SendStream {
     }
 
     pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), SendError>> {
-        tracing::info!("Poll send");
         if let Some(fut) = &mut self.fut {
             ready!(fut.poll_unpin(cx).map_err(|err| {
                 tracing::error!("Sending failed: {err:?}");
@@ -155,17 +133,13 @@ impl SendStream {
             }))?;
             self.fut = None;
 
-            tracing::info!("ready to send");
-
             Poll::Ready(Ok(()))
         } else {
-            tracing::info!("nothing to send");
             Poll::Ready(Ok(()))
         }
     }
 
     pub fn send_chunk(&mut self, buf: &[u8]) {
-        tracing::info!("send_chunk {buf:?}");
         if self.fut.is_some() {
             panic!("Send not ready");
         }
@@ -183,7 +157,6 @@ impl AsyncWrite for SendStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        tracing::info!("poll_write");
         ready!(self.poll_ready(cx))?;
 
         let len = buf.len();
@@ -200,5 +173,24 @@ impl AsyncWrite for SendStream {
         Self::stop(&mut self);
 
         Poll::Ready(Ok(()))
+    }
+}
+
+pub struct ReadChunk<'a> {
+    stream: &'a mut RecvStream,
+}
+
+impl<'a> Future for ReadChunk<'a> {
+    type Output = Option<Result<Bytes, ReadError>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let data = ready!(self.stream.poll_read_chunk(cx)?);
+        tracing::info!("Data: {data:?}");
+
+        if let Some(data) = data {
+            Poll::Ready(Some(Ok(mem::take(data))))
+        } else {
+            Poll::Ready(None)
+        }
     }
 }

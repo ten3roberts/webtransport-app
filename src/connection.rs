@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::anyhow;
 use bytes::Bytes;
-use futures::{Future, StreamExt};
+use futures::{ready, Future, StreamExt};
 use js_sys::Uint8Array;
 use parking_lot::Mutex;
 use url::Url;
@@ -13,16 +13,19 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     ReadableStream, ReadableStreamDefaultReader, WebTransport, WebTransportBidirectionalStream,
-    WritableStream, WritableStreamDefaultWriter,
+    WebTransportReceiveStream, WritableStream, WritableStreamDefaultWriter,
 };
 
-use crate::{Datagrams, ReadDatagramError, RecvStream, SendStream};
+use crate::{
+    reader::{ReadError, StreamReader},
+    RecvStream, SendStream,
+};
 
 pub struct Connection {
     transport: WebTransport,
     datagrams: WritableStreamDefaultWriter,
-    incoming_datagrams: Mutex<Datagrams>,
-    incoming_recv_streams: ReadableStreamDefaultReader,
+    incoming_datagrams: Mutex<StreamReader<Uint8Array>>,
+    incoming_recv_streams: Mutex<StreamReader<ReadableStream>>,
     incoming_bi_streams: ReadableStreamDefaultReader,
 }
 
@@ -49,15 +52,9 @@ impl Connection {
         let datagrams = datagrams.writable().get_writer().unwrap();
         let incoming_datagrams = transport.datagrams().readable();
 
-        let incoming_datagrams = Datagrams::new(incoming_datagrams);
+        let incoming_datagrams = StreamReader::new(incoming_datagrams);
 
-        let incoming_recv_streams = {
-            transport
-                .incoming_unidirectional_streams()
-                .get_reader()
-                .dyn_into()
-                .unwrap()
-        };
+        let incoming_recv_streams = StreamReader::new(transport.incoming_unidirectional_streams());
 
         let incoming_bi_streams = {
             transport
@@ -71,7 +68,7 @@ impl Connection {
             transport,
             datagrams,
             incoming_datagrams: Mutex::new(incoming_datagrams),
-            incoming_recv_streams,
+            incoming_recv_streams: Mutex::new(incoming_recv_streams),
             incoming_bi_streams,
         })
     }
@@ -104,23 +101,16 @@ impl Connection {
     }
 
     /// Accepts an incoming unidirectional stream
-    pub async fn accept_uni(&self) -> anyhow::Result<RecvStream> {
-        let stream = JsFuture::from(self.incoming_recv_streams.read())
-            .await
-            .map_err(|e| anyhow!("{e:?}"))?
-            .dyn_into::<ReadableStream>()
-            .unwrap();
-
-        tracing::info!("Got unidirectional stream");
-
-        let reader = stream.get_reader().dyn_into().unwrap();
-
-        Ok(RecvStream::new(reader))
+    pub fn accept_uni(&self) -> AcceptUni {
+        AcceptUni {
+            stream: &self.incoming_recv_streams,
+        }
     }
 
+    /// Reads the next datagram from the connection
     pub fn read_datagram(&self) -> ReadDatagram<'_> {
         ReadDatagram {
-            icoming_datagrams: &self.incoming_datagrams,
+            stream: &self.incoming_datagrams,
         }
     }
 
@@ -137,15 +127,42 @@ impl Connection {
 
 /// Reads the next datagram from the connection
 pub struct ReadDatagram<'a> {
-    icoming_datagrams: &'a Mutex<Datagrams>,
+    stream: &'a Mutex<StreamReader<Uint8Array>>,
 }
 
 impl Future for ReadDatagram<'_> {
-    type Output = Option<Result<Bytes, ReadDatagramError>>;
+    type Output = Option<Result<Bytes, ReadError>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut datagrams = self.icoming_datagrams.lock();
+        let mut datagrams = self.stream.lock();
 
-        datagrams.poll_next_unpin(cx)
+        let data = ready!(datagrams.poll_next(cx));
+
+        match data {
+            Some(Ok(data)) => Poll::Ready(Some(Ok(data.to_vec().into()))),
+            Some(Err(err)) => Poll::Ready(Some(Err(err))),
+            None => Poll::Ready(None),
+        }
+    }
+}
+
+/// Reads the next datagram from the connection
+pub struct AcceptUni<'a> {
+    stream: &'a Mutex<StreamReader<ReadableStream>>,
+}
+
+impl Future for AcceptUni<'_> {
+    type Output = Option<Result<RecvStream, ReadError>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut datagrams = self.stream.lock();
+
+        let data = ready!(datagrams.poll_next(cx));
+
+        match data {
+            Some(Ok(data)) => Poll::Ready(Some(Ok(RecvStream::new(data)))),
+            Some(Err(err)) => Poll::Ready(Some(Err(err))),
+            None => Poll::Ready(None),
+        }
     }
 }
