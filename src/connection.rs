@@ -26,7 +26,7 @@ pub struct Connection {
     datagrams: WritableStreamDefaultWriter,
     incoming_datagrams: Mutex<StreamReader<Uint8Array>>,
     incoming_recv_streams: Mutex<StreamReader<ReadableStream>>,
-    incoming_bi_streams: ReadableStreamDefaultReader,
+    incoming_bi_streams: Mutex<StreamReader<WebTransportBidirectionalStream>>,
 }
 
 impl Drop for Connection {
@@ -52,23 +52,21 @@ impl Connection {
         let datagrams = datagrams.writable().get_writer().unwrap();
         let incoming_datagrams = transport.datagrams().readable();
 
-        let incoming_datagrams = StreamReader::new(incoming_datagrams);
+        let incoming_datagrams = Mutex::new(StreamReader::new(incoming_datagrams));
 
-        let incoming_recv_streams = StreamReader::new(transport.incoming_unidirectional_streams());
+        let incoming_recv_streams = Mutex::new(StreamReader::new(
+            transport.incoming_unidirectional_streams(),
+        ));
 
-        let incoming_bi_streams = {
-            transport
-                .incoming_bidirectional_streams()
-                .get_reader()
-                .dyn_into()
-                .unwrap()
-        };
+        let incoming_bi_streams = Mutex::new(StreamReader::new(
+            transport.incoming_bidirectional_streams(),
+        ));
 
         Ok(Connection {
             transport,
             datagrams,
-            incoming_datagrams: Mutex::new(incoming_datagrams),
-            incoming_recv_streams: Mutex::new(incoming_recv_streams),
+            incoming_datagrams,
+            incoming_recv_streams,
             incoming_bi_streams,
         })
     }
@@ -83,21 +81,24 @@ impl Connection {
         Ok(SendStream::new(stream))
     }
 
-    /// Accepts an incoming bidirectional stream
-    pub async fn accept_bi(&self) -> anyhow::Result<(SendStream, RecvStream)> {
-        let stream = JsFuture::from(self.incoming_bi_streams.read())
+    pub async fn open_bi(&self) -> anyhow::Result<(SendStream, RecvStream)> {
+        let stream = JsFuture::from(self.transport.create_bidirectional_stream())
             .await
             .map_err(|e| anyhow!("{e:?}"))?
             .dyn_into::<WebTransportBidirectionalStream>()
             .unwrap();
 
-        tracing::info!("Got bidirectional stream");
-
-        let recv = stream.readable().dyn_into().unwrap();
         let send = stream.writable().dyn_into().unwrap();
+        let recv = stream.readable().dyn_into().unwrap();
 
-        // Use the new methods
         Ok((SendStream::new(send), RecvStream::new(recv)))
+    }
+
+    /// Accepts an incoming bidirectional stream
+    pub fn accept_bi(&self) -> AcceptBi {
+        AcceptBi {
+            stream: &self.incoming_bi_streams,
+        }
     }
 
     /// Accepts an incoming unidirectional stream
@@ -151,17 +152,41 @@ pub struct AcceptUni<'a> {
     stream: &'a Mutex<StreamReader<ReadableStream>>,
 }
 
-impl Future for AcceptUni<'_> {
+impl<'a> Future for AcceptUni<'a> {
     type Output = Option<Result<RecvStream, ReadError>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut datagrams = self.stream.lock();
 
-        let data = ready!(datagrams.poll_next(cx));
+        let data = ready!(datagrams.poll_next(cx)?);
 
         match data {
-            Some(Ok(data)) => Poll::Ready(Some(Ok(RecvStream::new(data)))),
-            Some(Err(err)) => Poll::Ready(Some(Err(err))),
+            Some(data) => Poll::Ready(Some(Ok(RecvStream::new(data)))),
+            None => Poll::Ready(None),
+        }
+    }
+}
+
+/// Reads the next datagram from the connection
+pub struct AcceptBi<'a> {
+    stream: &'a Mutex<StreamReader<WebTransportBidirectionalStream>>,
+}
+
+impl<'a> Future for AcceptBi<'a> {
+    type Output = Option<Result<(SendStream, RecvStream), ReadError>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut datagrams = self.stream.lock();
+
+        let data = ready!(datagrams.poll_next(cx)?);
+
+        match data {
+            Some(data) => {
+                let send = data.writable().dyn_into().unwrap();
+                let recv = data.readable().dyn_into().unwrap();
+
+                Poll::Ready(Some(Ok((SendStream::new(send), RecvStream::new(recv)))))
+            }
             None => Poll::Ready(None),
         }
     }
