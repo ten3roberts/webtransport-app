@@ -23,6 +23,8 @@ body {
   padding: 1em;
   background-color: #bfbfbf;
   border: 1px solid #127369;
+  max-height: 50em;
+  overflow-y: auto;
 }
 
 .message {

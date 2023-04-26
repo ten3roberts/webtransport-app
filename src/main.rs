@@ -1,28 +1,18 @@
-use core::task::{self, Context};
 use std::{
     fmt::{self, Debug, Display, Formatter},
-    io,
     ops::Deref,
-    pin::Pin,
-    process::Output,
     str::FromStr,
     sync::Arc,
-    task::Poll,
     time::Duration,
 };
 
-use anyhow::anyhow;
 use app::{Connection, RecvStream, SendStream};
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use closure::closure;
 use flume::{Receiver, Sender};
-use futures::{
-    ready, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Future, FutureExt, Stream, StreamExt,
-};
-use js_sys::{Boolean, JsString, Reflect, Uint8Array};
+use futures::{AsyncReadExt, AsyncWriteExt};
+
 use parking_lot::Mutex;
-use pin_project::pin_project;
-use thiserror::Error;
 use tokio::select;
 use tracing_subscriber::{
     fmt::time::UtcTime, prelude::__tracing_subscriber_SubscriberExt, registry,
@@ -30,12 +20,7 @@ use tracing_subscriber::{
 };
 use tracing_web::MakeConsoleWriter;
 use url::Url;
-use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::JsFuture;
-use web_sys::{
-    console::info, ReadableStream, ReadableStreamDefaultReader, WebTransport,
-    WebTransportBidirectionalStream, WritableStream, WritableStreamDefaultWriter,
-};
+
 use yew::prelude::*;
 mod input;
 use input::*;
@@ -53,10 +38,11 @@ fn App() -> Html {
 
     let connect = match url.deref().clone() {
         Some(Ok(url)) => {
-            let connect = Callback::from(
-                closure!(clone client, |_| client.set(Some(Arc::new(ClientInstance::new(url.clone()))))
-                ),
-            );
+            let client = client.clone();
+
+            let connect = Callback::from(move |_| {
+                client.set(Some(Arc::new(ClientInstance::new(url.clone()))))
+            });
 
             html! { <button onclick={connect}>{"Connect"}</button> }
         }
@@ -92,6 +78,7 @@ enum Event {
     UniStream(Bytes),
     BiStream(Bytes),
     Error(anyhow::Error),
+    Connected(Url),
 }
 
 impl Display for Event {
@@ -101,6 +88,7 @@ impl Display for Event {
             Event::UniStream(v) => write!(f, "UniStream {v:?}"),
             Event::BiStream(v) => write!(f, "BiStream {v:?}"),
             Event::Error(err) => write!(f, "Error {err:?}"),
+            Event::Connected(url) => write!(f, "Connected to {url}"),
         }
     }
 }
@@ -193,7 +181,9 @@ impl ClientInstance {
         let u = url.clone();
         let run = async move {
             tracing::info!("Opening connection");
-            let conn = Connection::connect(u).await?;
+            let conn = Connection::connect(u.clone()).await?;
+
+            event_tx.send(Event::Connected(u))?;
 
             loop {
                 let res = select! {
@@ -278,7 +268,7 @@ impl ClientInstance {
     }
 }
 
-#[derive(Properties)]
+#[derive(Clone, Properties)]
 struct ClientProps {
     client: Arc<ClientInstance>,
 }
@@ -292,6 +282,18 @@ impl PartialEq for ClientProps {
     }
 }
 
+pub fn push_message(messages: &UseStateHandle<Arc<Mutex<Vec<String>>>>, msg: impl Display) {
+    {
+        let mut messages = messages.try_lock().unwrap();
+
+        let num = messages.len();
+        let msg = format!("{num:>5} {msg}");
+        tracing::info!("Got message: {msg:?}");
+        messages.push(msg);
+    }
+    messages.set((*messages).deref().clone());
+}
+
 #[function_component]
 fn ClientView(props: &ClientProps) -> Html {
     tracing::info!("ClientView");
@@ -300,30 +302,38 @@ fn ClientView(props: &ClientProps) -> Html {
 
     let messages = use_state(|| Arc::new(Mutex::new(Vec::new())));
 
-    use_state(|| {
-        let client = client.clone();
+    tracing::info!("Drawing client view");
+
+    {
         let messages = messages.clone();
+        use_effect_with_deps(
+            move |props| {
+                let client = props.client.clone();
 
-        wasm_bindgen_futures::spawn_local(async move {
-            tracing::info!("Spawning message loop");
-            let mut message_num = 1;
-            while let Ok(event) = client.event_rx.recv_async().await {
-                {
-                    let mut messages = messages.lock();
-                    if messages.len() >= 32 {
-                        messages.remove(0);
+                tracing::info!("Spawning message read loop");
+
+                wasm_bindgen_futures::spawn_local(async move {
+                    tracing::info!("Spawning message loop");
+                    let mut message_num = 1;
+                    while let Ok(event) = client.event_rx.recv_async().await {
+                        {
+                            let mut messages = messages.lock();
+                            if messages.len() >= 32 {
+                                messages.remove(0);
+                            }
+
+                            let msg = format!("{message_num:>5} {event}");
+                            tracing::info!("Got message: {msg:?}");
+                            messages.push(msg);
+                            message_num += 1;
+                        }
+                        messages.set(messages.deref().clone());
                     }
-
-                    let msg = format!("{message_num:>5} {event}");
-                    tracing::info!("Got message: {msg:?}");
-                    messages.push(msg);
-                    message_num += 1;
-                }
-                messages.set(messages.deref().clone());
-            }
-        });
-    });
-
+                });
+            },
+            props.clone(),
+        );
+    }
     let send_datagram = Callback::from(closure!( clone client,|v: String| {
         let data: Bytes = v.into_bytes().into();
 
