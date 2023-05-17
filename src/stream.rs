@@ -25,7 +25,7 @@ impl RecvStream {
     pub(crate) fn new(stream: ReadableStream) -> Self {
         Self {
             buf: Bytes::new(),
-            stream: StreamReader::new(stream),
+            stream: StreamReader::new(Some("recv_stream"), stream),
         }
     }
 
@@ -71,12 +71,6 @@ impl AsyncRead for RecvStream {
             None => Poll::Ready(Ok(0)),
         }
     }
-}
-
-#[derive(Error, Debug)]
-pub enum RecvError {
-    #[error("Failed to read from stream: {0}")]
-    ReadError(String),
 }
 
 #[derive(thiserror::Error, Debug, Clone)]

@@ -31,8 +31,6 @@ pub struct Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        tracing::info!("Dropping connection");
-
         self.transport.close();
     }
 }
@@ -52,13 +50,18 @@ impl Connection {
         let datagrams = datagrams.writable().get_writer().unwrap();
         let incoming_datagrams = transport.datagrams().readable();
 
-        let incoming_datagrams = Mutex::new(StreamReader::new(incoming_datagrams));
+        let incoming_datagrams = Mutex::new(StreamReader::new(
+            Some("incoming_datagrams"),
+            incoming_datagrams,
+        ));
 
         let incoming_recv_streams = Mutex::new(StreamReader::new(
+            Some("incoming_uni"),
             transport.incoming_unidirectional_streams(),
         ));
 
         let incoming_bi_streams = Mutex::new(StreamReader::new(
+            Some("incoming_bi"),
             transport.incoming_bidirectional_streams(),
         ));
 

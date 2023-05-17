@@ -41,7 +41,7 @@ fn App() -> Html {
             let client = client.clone();
 
             let connect = Callback::from(move |_| {
-                client.set(Some(Arc::new(ClientInstance::new(url.clone()))))
+                client.set(Some(Arc::new(ClientInstance::connect(url.clone()))))
             });
 
             html! { <button onclick={connect}>{"Connect"}</button> }
@@ -54,6 +54,8 @@ fn App() -> Html {
         }
     };
 
+    let set_client = client.setter();
+
     html! {
         <div class="content">
             <div class="flex">
@@ -65,7 +67,7 @@ fn App() -> Html {
             </div>
 
         if let Some(client) = &*client {
-            <ClientView client={client}/>
+            <ClientView client={client} setclient={set_client}/>
         }
 
         </div>
@@ -79,6 +81,7 @@ enum Event {
     BiStream(Bytes),
     Error(anyhow::Error),
     Connected(Url),
+    Disconnected,
 }
 
 impl Display for Event {
@@ -89,6 +92,7 @@ impl Display for Event {
             Event::BiStream(v) => write!(f, "BiStream {v:?}"),
             Event::Error(err) => write!(f, "Error {err:?}"),
             Event::Connected(url) => write!(f, "Connected to {url}"),
+            Event::Disconnected => write!(f, "Disconnected"),
         }
     }
 }
@@ -97,6 +101,7 @@ enum Action {
     Datagram(Bytes),
     UniStream(Bytes),
     BiStream(Bytes),
+    Disconnect,
 }
 
 pub struct ClientInstance {
@@ -174,9 +179,11 @@ async fn send_bytes_chunked(stream: &mut SendStream, data: Bytes) -> anyhow::Res
 }
 
 impl ClientInstance {
-    fn new(url: Url) -> Self {
+    fn connect(url: Url) -> Self {
         let (event_tx, event_rx) = flume::bounded::<Event>(128);
         let (action_tx, action_rx) = flume::bounded::<Action>(128);
+
+        let event_tx2 = event_tx.clone();
 
         let u = url.clone();
         let run = async move {
@@ -185,65 +192,61 @@ impl ClientInstance {
 
             event_tx.send(Event::Connected(u))?;
 
+            scopeguard::defer!({
+                tracing::info!("Sending disconnect");
+                event_tx.send(Event::Disconnected).ok();
+            });
+
             loop {
-                let res = select! {
-                        Ok(action) = action_rx.recv_async() => {
-                            match action {
-                                Action::Datagram(data) => conn.send_datagram(&data[..]).await?,
-                                Action::BiStream(data) => {
-                                    let tx = event_tx.clone();
-                                    let (send, recv) = conn.open_bi().await?;
+                select! {
+                    Ok(action) = action_rx.recv_async() => {
+                        match action {
+                            Action::Datagram(data) => conn.send_datagram(&data[..]).await?,
+                            Action::BiStream(data) => {
+                                let tx = event_tx.clone();
+                                let (send, recv) = conn.open_bi().await?;
 
-                                    tracing::info!("Opened bi stream");
-                                    wasm_bindgen_futures::spawn_local(async move {
-                                        log_result!( handle_open_bi(send, recv, data, tx).await)
-                                    });
-                                }
-                                Action::UniStream(data) => {
-                                    tracing::info!("Opening uni stream");
-                                    let stream = conn.open_uni().await?;
-                                    wasm_bindgen_futures::spawn_local(async move {
-                                        log_result!( handle_open_uni(stream, data).await)
-                                    });
-                                }
+                                tracing::info!("Opened bi stream");
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    log_result!( handle_open_bi(send, recv, data, tx).await)
+                                });
                             }
+                            Action::UniStream(data) => {
+                                tracing::info!("Opening uni stream");
+                                let stream = conn.open_uni().await?;
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    log_result!( handle_open_uni(stream, data).await)
+                                });
+                            }
+                            Action::Disconnect => {
+                                break;
+                            }
+                        }
+                    },
+                    Some(res) = conn.accept_bi() => {
+                        let (send, recv)= res?;
 
-                            Ok(()) as anyhow::Result<_>
-                        },
-                        Some(res) = conn.accept_bi() => {
-                            let (send, recv)= res?;
+                        tracing::info!("Got bidirectional stream");
+                        let tx = event_tx.clone();
 
-                            tracing::info!("Got bidirectional stream");
-                            let tx = event_tx.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            log_result!(handle_incoming_bi(send, recv, tx).await);
+                        });
+                    },
+                    Some(stream) = conn.accept_uni() => {
+                        let stream = stream?;
 
-                            wasm_bindgen_futures::spawn_local(async move {
-                                log_result!(handle_incoming_bi(send, recv, tx).await);
-                            });
-
-                            Ok(())
-                        },
-                        Some(stream) = conn.accept_uni() => {
-                            let stream = stream?;
-
-                            let tx = event_tx.clone();
-                            wasm_bindgen_futures::spawn_local(async move {
-                                log_result!(handle_incoming_uni(stream, tx).await);
-                            });
-
-
-                            Ok(())
-                        },
-                        Some(data) = conn.read_datagram() => {
-                            let data = data?;
-                            event_tx.send_async(Event::Datagram(data)).await.ok();
-                            Ok(())
-                        },
-                        else => { break; }
+                        let tx = event_tx.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            log_result!(handle_incoming_uni(stream, tx).await);
+                        });
+                    },
+                    Some(data) = conn.read_datagram() => {
+                        let data = data?;
+                        event_tx.send_async(Event::Datagram(data)).await.ok();
+                    },
+                    else => { break; }
                 };
-
-                if let Err(err) = res {
-                    event_tx.send_async(Event::Error(err)).await.ok();
-                }
             }
 
             Ok(()) as anyhow::Result<_>
@@ -256,6 +259,7 @@ impl ClientInstance {
                 }
                 Err(err) => {
                     tracing::error!("Client error\n\n{err:?}");
+                    event_tx2.send(Event::Error(err)).ok();
                 }
             }
         });
@@ -271,14 +275,16 @@ impl ClientInstance {
 #[derive(Clone, Properties)]
 struct ClientProps {
     client: Arc<ClientInstance>,
+    setclient: UseStateSetter<Option<Arc<ClientInstance>>>,
 }
 
 impl PartialEq for ClientProps {
     fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(
-            &*self.client as *const ClientInstance,
-            &*other.client as *const ClientInstance,
-        )
+        self.setclient == other.setclient
+            && std::ptr::eq(
+                &*self.client as *const ClientInstance,
+                &*other.client as *const ClientInstance,
+            )
     }
 }
 
@@ -309,6 +315,7 @@ fn ClientView(props: &ClientProps) -> Html {
         use_effect_with_deps(
             move |props| {
                 let client = props.client.clone();
+                let setclient = props.setclient.clone();
 
                 tracing::info!("Spawning message read loop");
 
@@ -316,6 +323,11 @@ fn ClientView(props: &ClientProps) -> Html {
                     tracing::info!("Spawning message loop");
                     let mut message_num = 1;
                     while let Ok(event) = client.event_rx.recv_async().await {
+                        if let Event::Disconnected = event {
+                            setclient.set(None);
+                            break;
+                        }
+
                         {
                             let mut messages = messages.lock();
                             if messages.len() >= 32 {
@@ -354,11 +366,15 @@ fn ClientView(props: &ClientProps) -> Html {
         log_result!(client.action_tx.send(Action::BiStream(data)))
     }));
 
+    let send_disconnect = Callback::from(closure!(clone client, |()| {
+        log_result!(client.action_tx.send(Action::Disconnect))
+    }));
+
     html! {
         <div>
             <div>
                 <span>{"Connected to "}{client.url.clone()}</span>
-                <MessageBox senddatagram={send_datagram} senduni={send_uni} sendbi={send_bi}/>
+                <MessageBox senddatagram={send_datagram} senduni={send_uni} sendbi={send_bi} senddisconnect={send_disconnect}/>
             </div>
 
             <div class="message-view">
@@ -375,6 +391,7 @@ struct MessageBoxProps {
     senddatagram: Callback<String>,
     senduni: Callback<String>,
     sendbi: Callback<String>,
+    senddisconnect: Callback<()>,
 }
 
 #[function_component]
@@ -391,11 +408,13 @@ fn MessageBox(props: &MessageBoxProps) -> Html {
     let senddatagram = props.senddatagram.clone();
     let senduni = props.senduni.clone();
     let sendbi = props.sendbi.clone();
+    let senddisconnect = props.senddisconnect.clone();
 
     let send_datagram =
         Callback::from(closure!(clone text,  |_| senddatagram.emit(text.deref().clone())));
     let send_uni = Callback::from(closure!(clone text, |_| senduni.emit(text.deref().clone())));
     let send_bi = Callback::from(closure!(clone text, |_| sendbi.emit(text.deref().clone())));
+    let send_disconnect = Callback::from(closure!(|_| senddisconnect.emit(())));
 
     html! {
         <div>
@@ -405,6 +424,7 @@ fn MessageBox(props: &MessageBoxProps) -> Html {
             <button onclick={ send_datagram }>{"Send Datagram"}</button>
             <button onclick={ send_uni }>{"Send Uni"}</button>
             <button onclick={ send_bi }>{"Send Bi"}</button>
+            <button onclick={ send_disconnect }>{"Send Disconnect"}</button>
         </div>
     }
 }
